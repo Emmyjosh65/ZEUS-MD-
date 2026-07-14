@@ -1,1 +1,15 @@
-
+{
+  "name": "zeus-md-bot",
+  "version": "2.0.0",
+  "description": "ZEUS MD - Multi-Device WhatsApp Bot with Groq AI",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.16",
+    "pino": "^8.21.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
