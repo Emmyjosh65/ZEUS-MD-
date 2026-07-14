@@ -1,10 +1,10 @@
 import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
-import readline from 'readline';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import http from 'http';
 import config from './config.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -12,7 +12,17 @@ const SESSION_DIR = path.join(__dirname, 'sessions');
 
 if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR, { recursive: true });
 
-const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+// ─── PTERODACTYL KEEP-ALIVE HTTP SERVER ───
+const PORT = process.env.PORT || 2091;
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('ZEUS-MD Bot is running\n');
+}).listen(PORT, () => {
+  console.log(`🌐 Health check server listening on port ${PORT}`);
+});
+
+// ─── BOT LOGGER ───
+const logger = pino({ level: 'silent' });
 
 async function startBot() {
   const { version, isLatest } = await fetchLatestBaileysVersion();
@@ -27,25 +37,31 @@ async function startBot() {
 
   const sock = makeWASocket({
     version,
-    logger: pino({ level: 'silent' }),
+    logger,
     printQRInTerminal: false,
     auth: {
       creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })),
+      keys: makeCacheableSignalKeyStore(state.keys, logger),
     },
     browser: ['ZEUS-MD', 'Chrome', '120.0.0'],
     markOnlineOnConnect: true,
   });
 
-  // ─── PAIRING CODE ───
+  // ─── PAIRING CODE (NON-INTERACTIVE FOR PTERODACTYL) ───
   if (!sock.authState.creds.registered) {
-    console.log('⚡ No session found. Requesting pairing code...\n');
-    const phoneNumber = await new Promise((resolve) => {
-      rl.question('📱 Enter your WhatsApp number (country code, no +, no spaces): ', resolve);
-    });
-    rl.close();
+    const phoneNumber = process.env.PHONE_NUMBER;
+
+    if (!phoneNumber) {
+      console.log('❌ ERROR: No WhatsApp session found and PHONE_NUMBER env variable is not set.');
+      console.log('📌 Go to Pterodactyl → Startup → Add PHONE_NUMBER variable with your number.');
+      console.log('📌 Format: country code + number, no + or spaces (e.g., 2349066760078)');
+      // Keep trying every 30 seconds in case the env gets set later
+      setTimeout(startBot, 30000);
+      return;
+    }
 
     try {
+      console.log(`⚡ No session found. Requesting pairing code for ${phoneNumber}...`);
       const code = await sock.requestPairingCode(phoneNumber.trim());
       console.log(`\n🔐 ─── YOUR PAIRING CODE ───`);
       console.log(`   ${code}`);
@@ -53,9 +69,15 @@ async function startBot() {
       console.log('📲 Open WhatsApp on your phone');
       console.log('⚙️ Settings → Linked Devices → Link with Phone Number');
       console.log(`⌨️ Enter the code above\n`);
+      console.log('⏳ Waiting 2 minutes for you to pair...');
+
+      // Wait 2 minutes for pairing, then reconnect logic takes over
+      await new Promise(resolve => setTimeout(resolve, 120000));
     } catch (err) {
       console.error('❌ Pairing failed:', err.message);
-      process.exit(1);
+      console.log('🔄 Retrying in 15 seconds...');
+      setTimeout(startBot, 15000);
+      return;
     }
   }
 
@@ -68,6 +90,14 @@ async function startBot() {
       console.log(`🔌 Disconnected: ${reason || 'unknown'}`);
       if (reason === DisconnectReason.loggedOut) {
         console.log('❌ Logged out. Delete sessions/ folder and restart.');
+        // Delete session so it re-requests pairing on next start
+        try {
+          fs.rmSync(SESSION_DIR, { recursive: true, force: true });
+          fs.mkdirSync(SESSION_DIR, { recursive: true });
+          console.log('🧹 Sessions cleared. Will request new pairing on restart.');
+        } catch (e) {
+          console.error('Failed to clear sessions:', e.message);
+        }
         process.exit(1);
       } else {
         console.log('🔄 Reconnecting in 5 seconds...');
