@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
@@ -10,7 +11,14 @@ import config from './config.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SESSION_DIR = path.join(__dirname, 'sessions');
 
-if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR, { recursive: true });
+// ─── SESSION DIR SETUP (handles the placeholder "sessions" file in the repo) ───
+if (!fs.existsSync(SESSION_DIR)) {
+  fs.mkdirSync(SESSION_DIR, { recursive: true });
+} else if (!fs.statSync(SESSION_DIR).isDirectory()) {
+  console.warn('⚠️ "sessions" is not a directory. Removing it and creating a folder...');
+  fs.rmSync(SESSION_DIR, { force: true });
+  fs.mkdirSync(SESSION_DIR, { recursive: true });
+}
 
 // ─── PTERODACTYL KEEP-ALIVE HTTP SERVER ───
 const PORT = process.env.PORT || 2091;
@@ -47,6 +55,9 @@ async function startBot() {
     markOnlineOnConnect: true,
   });
 
+  // ─── SAVE CREDS IMMEDIATELY (moved BEFORE pairing so the session persists) ───
+  sock.ev.on('creds.update', saveCreds);
+
   // ─── PAIRING CODE (NON-INTERACTIVE FOR PTERODACTYL) ───
   if (!sock.authState.creds.registered) {
     const phoneNumber = process.env.PHONE_NUMBER;
@@ -82,8 +93,6 @@ async function startBot() {
   }
 
   // ─── CONNECTION HANDLER ───
-  sock.ev.on('creds.update', saveCreds);
-
   sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
     if (connection === 'close') {
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
