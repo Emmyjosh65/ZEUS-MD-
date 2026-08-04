@@ -19,7 +19,9 @@ const DELPREM_CMD = {
     delete (db.premiumExpiry || {})[target];
     saveDB(db);
 
-    return sock.sendMessage(from, { text: `✅ Removed *${target}* from premium.` }, { quoted: msg });
+    return sock.sendMessage(from, {
+      text: `✅ Removed *${target}* from premium.`,
+    }, { quoted: msg });
   },
 };
 
