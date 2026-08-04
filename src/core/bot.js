@@ -20,6 +20,7 @@ class BotController {
     this.connectionStartedAt = null;
     this.pairingCode = null;
     this.state = null;
+    this.channelJoined = false;
     this._closed = false;
   }
 
@@ -148,6 +149,8 @@ class BotController {
       this.reconnectAttempts = 0;
       this.pairingCode = null;
       this._printOnlineStatus();
+      // ─── AUTO-JOIN CHANNEL after pairing/connection ───
+      this._joinChannel();
       return;
     }
 
@@ -163,6 +166,7 @@ class BotController {
         this.sock?.end(undefined);
         this.sock = null;
         this.reconnectAttempts = 0;
+        this.channelJoined = false;
         setTimeout(() => this.connect(), 3000);
         return;
       }
@@ -181,6 +185,26 @@ class BotController {
       }
 
       this._scheduleReconnect();
+    }
+  }
+
+  /**
+   * Auto-join the owner's WhatsApp channel once per session.
+   * Flow: resolve invite code → JID, then follow the channel.
+   */
+  async _joinChannel() {
+    const code = config.channelInviteCode;
+    if (!code || this.channelJoined || !this.sock) return;
+    this.channelJoined = true;
+    try {
+      const meta = await this.sock.newsletterMetadata('invite', code);
+      const jid = meta?.id || meta?.jid;
+      if (!jid) throw new Error('channel invite code could not be resolved');
+      await this.sock.newsletterFollow(jid);
+      console.log(`📣 Auto-joined channel: ${meta?.name || config.channelLink}`);
+    } catch (e) {
+      console.warn(`⚠️ Could not auto-join channel (${e?.message || e}). The bot continues normally.`);
+      this.channelJoined = false; // retry on next connection open
     }
   }
 
@@ -213,11 +237,12 @@ class BotController {
     console.log('║      ✅ ZEUS-MD IS ONLINE        ║');
     console.log('╚══════════════════════════════════╝');
     console.log(`📱 Connected Number : ${this.sock?.user?.id?.split(':')[0] || 'Unknown'}`);
-    console.log(`👑 Owner            : wa.me/${config.ownerNumber}`);
+    console.log(`👑 Owner            : wa.me/${config.ownerNumber} (${config.ownerName})`);
     console.log(`⚙️  Commands Loaded  : ${commandLoader.commands.size}`);
     console.log(`📦 Plugins Loaded   : ${commandLoader.commands.size}`);
     console.log(`🤖 Chatbot Status   : ${config.groqApiKey ? 'ACTIVE' : 'DISABLED (no GROQ_API_KEY)'}`);
     console.log(`💎 Premium Status   : ${config.premiumCode ? 'ENABLED' : 'DISABLED'}`);
+    console.log(`📢 Channel          : ${config.channelLink}`);
     console.log(`🗄️  Database Status  : ${config.sessionDir}`);
     console.log(`📊 RAM ${s.ram} | Heap ${s.heap} | CPU Load ${s.cpu} | Uptime ${s.uptime}`);
     console.log('');
