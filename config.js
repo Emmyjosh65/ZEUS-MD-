@@ -28,6 +28,9 @@ const config = {
   port: parseInt(process.env.PORT || '2091', 10),
   hotReload: process.env.HOT_RELOAD !== 'false',
   sessionDir: path.join(__dirname, 'sessions'),
+  browser: process.env.BROWSER
+    ? process.env.BROWSER.split(',').map((s) => s.trim())
+    : ['ZEUS-MD', 'Chrome', '120.0.0.0'],
 
   // ─── ZEUS TIER'S WhatsApp Channel (bot auto-joins after pairing) ───
   channelLink: clean(process.env.CHANNEL_LINK) || 'https://whatsapp.com/channel/0029VabYlvq6xCSKAxKpKB1m',
@@ -58,7 +61,7 @@ const config = {
   ],
 };
 
-// ─── Validation ───
+// ─── Validation (clear messages, no secrets printed) ───
 const problems = [];
 if (!config.ownerNumber) problems.push('❌ OWNER_NUMBER is missing or invalid (digits only).');
 if (Number.isNaN(config.port)) problems.push('❌ PORT must be a number.');
