@@ -23,6 +23,7 @@ ${prefix}menu — Show this menu
 ${prefix}info — Bot information
 ${prefix}ping — Check bot speed
 ${prefix}owner — Contact owner
+${prefix}channel — Official channel link
 ${prefix}premium — Premium info / redeem
 ${prefix}prem ${config.premiumCode} — Redeem premium code
 
@@ -48,6 +49,7 @@ ${prefix}prem ${config.premiumCode}
 
     menuText += `\n━━━━━━━━━━━━━━━
 ⚡ ${config.botName} v${config.version} • Groq AI
+📢 Channel: ${config.channelLink}
 ━━━━━━━━━━━━━━━`;
 
     await sock.sendMessage(from, { text: menuText, mentions: [sender] }, { quoted: msg });
