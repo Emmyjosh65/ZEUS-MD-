@@ -1,78 +1,61 @@
 import config from '../../config.js';
 
-// Stores conversation history for context
 const chatHistory = {};
+const MAX_HISTORY = 10;
+const TIMEOUT_MS = 20000;
 
 export async function getChatbotReply(message, senderNumber) {
-  const apiKey = config.groqApiKey;
-  const model = config.groqModel;
+  if (!config.groqApiKey) return '⚠️ Groq API key not configured. Contact the owner.';
 
-  if (!apiKey) {
-    return `⚠️ Groq API key not configured. Contact the owner.`;
-  }
-
-  // Initialize or get conversation history (last 6 messages for context)
   if (!chatHistory[senderNumber]) {
-    chatHistory[senderNumber] = [
-      {
-        role: 'system',
-        content: `You are ${config.chatbotName}, a helpful and friendly AI assistant for the WhatsApp bot ${config.botName}. You are powered by Groq's ${model}. Be concise, friendly, and helpful. Keep responses under 300 characters. The bot owner is ${config.ownerName}. The premium code is ${config.premiumCode}.`,
-      },
-    ];
+    chatHistory[senderNumber] = [{
+      role: 'system',
+      content: `You are ${config.chatbotName}, a helpful AI assistant for the WhatsApp bot ${config.botName}, powered by Groq's ${config.groqModel}. Be concise and friendly. Keep responses under 300 characters. Bot owner: ${config.ownerName}.`,
+    }];
   }
-
-  // Keep only last 10 messages to avoid token overflow
-  if (chatHistory[senderNumber].length > 10) {
+  if (chatHistory[senderNumber].length > MAX_HISTORY) {
     chatHistory[senderNumber] = [
       chatHistory[senderNumber][0],
-      ...chatHistory[senderNumber].slice(-8),
+      ...chatHistory[senderNumber].slice(-(MAX_HISTORY - 2)),
     ];
   }
+  chatHistory[senderNumber].push({ role: 'user', content: String(message).slice(0, 2000) });
 
-  // Add user message
-  chatHistory[senderNumber].push({ role: 'user', content: message });
-
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
   try {
     const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${apiKey}`,
+        Authorization: `Bearer ${config.groqApiKey}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: model,
+        model: config.groqModel,
         messages: chatHistory[senderNumber],
         max_tokens: 300,
         temperature: 0.7,
       }),
+      signal: controller.signal,
     });
 
     if (!response.ok) {
-      const errorData = await response.text();
-      console.error('⚠️ Groq API error:', response.status, errorData);
-      
-      if (response.status === 429) {
-        return `⏳ I'm a bit busy right now with too many requests. Try again in a moment!`;
-      }
-      if (response.status === 401) {
-        return `⚠️ AI service authentication error. Contact the owner.`;
-      }
-      return `🤖 I'm thinking... but having trouble. Give me a moment and try again!`;
+      console.error('⚠️ Groq API error:', response.status);
+      if (response.status === 429) return '⏳ Too many requests. Try again in a moment!';
+      if (response.status === 401) return '⚠️ AI authentication error. Contact the owner.';
+      return '🤖 I\'m having trouble right now. Give me a moment and try again!';
     }
 
     const data = await response.json();
     const reply = data.choices?.[0]?.message?.content?.trim();
+    if (!reply) return '🤖 I\'m not sure what to say to that. Could you ask me something else?';
 
-    if (!reply) {
-      return `🤖 I'm not sure what to say to that. Could you ask me something else?`;
-    }
-
-    // Store AI reply in history
     chatHistory[senderNumber].push({ role: 'assistant', content: reply });
-
     return reply;
   } catch (err) {
-    console.error('⚠️ Groq fetch error:', err.message);
-    return `🤖 Sorry, I'm having connection issues. Please try again!`;
+    console.error('⚠️ Groq fetch error:', err.name === 'AbortError' ? 'timeout' : err.message);
+    return '🤖 Sorry, connection issue. Please try again!';
+  } finally {
+    clearTimeout(timer);
   }
 }
