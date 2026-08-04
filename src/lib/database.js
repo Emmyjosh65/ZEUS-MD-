@@ -3,7 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-// Fix: resolves to ROOT/data/premium.json (was accidentally src/data/)
+// Resolves to ROOT/data/premium.json
 const DB_PATH = path.join(__dirname, '..', '..', 'data', 'premium.json');
 
 let cache = null;
