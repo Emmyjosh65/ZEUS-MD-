@@ -1,9 +1,15 @@
 import config from '../../config.js';
+import { isPremium } from '../lib/database.js';
 
-export async function menu(sock, msg, from, sender, senderNumber, isPremiumUser) {
-  const prefix = config.prefix;
+const MENU_CMD = {
+  name: 'menu',
+  aliases: ['help', 'commands'],
+  async run(sock, ctx) {
+    const { from, msg, sender } = ctx;
+    const prefix = config.prefix;
+    const isPremiumUser = isPremium(ctx.senderNumber);
 
-  let menuText = `╔══════════════════╗
+    let menuText = `╔══════════════════╗
 ║   *${config.botName}*   ║
 ╚══════════════════╝
 
@@ -18,7 +24,7 @@ ${prefix}info — Bot information
 ${prefix}ping — Check bot speed
 ${prefix}owner — Contact owner
 ${prefix}premium — Premium info / redeem
-${prefix}prem <code> — Redeem premium code
+${prefix}prem ${config.premiumCode} — Redeem premium code
 
 ━━━━━━━━━━━━━━━
 💎 *PREMIUM FEATURES* ${isPremiumUser ? '✅' : '🔒'}
@@ -27,25 +33,25 @@ ${isPremiumUser ? '✅' : '🔒'} ${prefix}chatbot on — AI Chatbot (Groq)
 ${isPremiumUser ? '✅' : '🔒'} ${prefix}chatbot off — Disable chatbot
 `;
 
-  config.premiumFeatures.forEach(f => {
-    menuText += `${isPremiumUser ? '✅' : '🔒'} ${f}\n`;
-  });
+    config.premiumFeatures.forEach((f) => {
+      menuText += `${isPremiumUser ? '✅' : '🔒'} ${f}\n`;
+    });
 
-  if (!isPremiumUser) {
-    menuText += `\n━━━━━━━━━━━━━━━
+    if (!isPremiumUser) {
+      menuText += `\n━━━━━━━━━━━━━━━
 ⬆️ *UPGRADE TO PREMIUM*
 ━━━━━━━━━━━━━━━
 ${prefix}prem ${config.premiumCode}
 👑 Owner: wa.me/${config.ownerNumber}
 `;
-  }
+    }
 
-  menuText += `\n━━━━━━━━━━━━━━━
-⚡ ${config.botName} v2.0 • Groq AI
+    menuText += `\n━━━━━━━━━━━━━━━
+⚡ ${config.botName} v${config.version} • Groq AI
 ━━━━━━━━━━━━━━━`;
 
-  await sock.sendMessage(from, {
-    text: menuText,
-    mentions: [sender],
-  }, { quoted: msg });
-}
+    await sock.sendMessage(from, { text: menuText, mentions: [sender] }, { quoted: msg });
+  },
+};
+
+export default MENU_CMD;
