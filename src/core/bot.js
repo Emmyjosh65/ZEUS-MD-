@@ -1,22 +1,30 @@
-import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } from '@whiskeysockets/baileys';
+import fs from 'fs';
+import {
+  makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore,
+} from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
-import { createRequire } from 'module';
 import config from '../../config.js';
 import { ensureSessionDir, quarantineCorruptSession, clearSessions } from './session.js';
 import { askPhoneNumber, isValidPhone, printPairingCode, printQR } from './pairing.js';
 import { banner, getStats, startStats, stopStats } from './logger.js';
 import { commandLoader } from './loader.js';
 
-const require = createRequire(import.meta.url);
-const logger = pino({ level: 'silent' });
+const logger = pino({ level: 'silent' }); // silences Baileys internal noise
 
 // ─── Pairing tuning (community-verified values) ───
-const PAIRING_DELAY_MS = 10000;        // wait 10s after 'connecting' before requesting code (#1774)
+const PAIRING_DELAY_MS = 10000;        // wait 10s after 'connecting' before requesting code
 const PAIRING_REFRESH_MS = 60000;      // refresh code every 60s if still unlinked
-const MAX_PAIRING_REFRESHES = 3;       // max 3 refreshes, then go quiet (WhatsApp rate-limit)
-const PAIRING_QUIET_MS = 600000;       // 10 min quiet before allowing another attempt
-const OPEN_WATCHDOG_MS = 45000;
+const MAX_PAIRING_REFRESHES = 3;       // max 3 refreshes, then go quiet (rate-limit safety)
+const PAIRING_QUIET_MS = 600000;       // 10 min quiet before another attempt
+const OPEN_WATCHDOG_MS = 45000;        // force reconnect if not open within 45s
+const RECONNECT_BASE_DELAY = 1000;     // exponential backoff: 1s, 2s, 4s... capped at 30s
+const RECONNECT_MAX_DELAY = 30000;
+const MAX_RECONNECT_ATTEMPTS = 10;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 class BotController {
@@ -25,7 +33,7 @@ class BotController {
     this.baileysVersion = null;
     this.connected = false;
     this.reconnectAttempts = 0;
-    this.maxReconnectAttempts = 10;
+    this.maxReconnectAttempts = MAX_RECONNECT_ATTEMPTS;
     this.reconnectTimer = null;
     this.connectionStartedAt = null;
     this.pairingCode = null;
@@ -39,267 +47,278 @@ class BotController {
     this._pairingRefreshTimer = null;
     this._registrationWatcher = null;
     this._openWatchdog = null;
-    this._pairingRefreshCount = 0;
+    this._connecting = false;
+    this._pairingRequested = false;
+    this._pairingRefreshes = 0;
+    this._phone = null;
     this._closed = false;
   }
 
+  // ───────────────────────── INIT ─────────────────────────
   async init() {
+    const { version } = await fetchLatestBaileysVersion();
+    this.baileysVersion = version;
+    banner(config, { baileys: version });
+
+    // Session folder: create if missing, delete if it's a file, clean corrupt JSON
     ensureSessionDir(config.sessionDir);
-    const quarantined = quarantineCorruptSession(config.sessionDir);
-    if (quarantined > 0) console.log(`🧹 Removed ${quarantined} corrupted session file(s).`);
+    quarantineCorruptSession(config.sessionDir);
 
-    const { version, isLatest } = await fetchLatestBaileysVersion();
-    this.baileysVersion = version.join('.');
-
-    try {
-      console.log(`📦 Baileys package: ${require('@whiskeysockets/baileys/package.json').version}`);
-    } catch {}
-
+    // Load commands (a broken plugin is skipped — bot keeps running)
     await commandLoader.init(config);
     commandLoader.watch();
-
-    banner(config, { baileys: `${this.baileysVersion}${isLatest ? '' : ' (update available)'}` });
     startStats();
 
-    this._attachProcessHandlers();
-    return this.connect();
-  }
-
-  _attachProcessHandlers() {
-    process.on('unhandledRejection', (reason) => {
-      console.error('⚠️ Unhandled rejection:', reason instanceof Error ? reason.stack : reason);
-    });
-    process.on('uncaughtException', (err) => {
-      console.error('⚠️ Uncaught exception:', err.stack || err);
-    });
-    for (const sig of ['SIGINT', 'SIGTERM']) {
-      process.on(sig, () => this.shutdown(sig));
+    // Detect if we already have a saved session
+    let hasSession = false;
+    try { hasSession = fs.readdirSync(config.sessionDir).length > 0; } catch { hasSession = false; }
+    this.pairingMode = !hasSession;
+    if (this.pairingMode) {
+      console.log('🔐 No saved session found — pairing mode enabled.');
+    } else {
+      console.log('💾 Saved session found — skipping pairing.');
     }
+
+    await this.connect();
   }
 
-  _attachSocketListeners(sock) {
-    sock.ev.on('creds.update', () => {
-      try { this.saveCreds?.(); } catch (e) { console.error('⚠️ creds.update error:', e.message); }
-    });
-    sock.ev.on('connection.update', (update) => this._handleConnectionUpdate(update));
-    sock.ev.on('messages.upsert', (data) => this._handleMessages(data));
-  }
-
+  // ───────────────────────── CONNECT ─────────────────────────
   async connect() {
     if (this._closed) return;
+    if (this._connecting) {
+      console.warn('⚠️ connect() called while already connecting — ignoring duplicate socket.');
+      return;
+    }
+    this._connecting = true;
+
+    // Kill any stale socket first → no duplicate sockets
     if (this.sock) {
       try { this.sock.end(undefined); } catch {}
       this.sock = null;
     }
 
-    const { state, saveCreds } = await useMultiFileAuthState(config.sessionDir);
-    this.state = state;
-    this.saveCreds = saveCreds;
-    this.connected = false;
-    this.onlineShown = false;
-
-    console.log(`🔌 Connecting (attempt ${this.reconnectAttempts + 1})...`);
-
-    const sock = makeWASocket({
-      version: this.baileysVersion ? this.baileysVersion.split('.').map(Number) : undefined,
-      logger,
-      printQRInTerminal: false,
-      connectTimeoutMs: 60000,
-      // 🔑 Known-good browser config — fixes pairing silently failing (#1242, #636)
-      browser: ['Chrome (Linux)', '', ''],
-      // 🔑 Fixes "Connection Closed" while requesting pairing code (#390)
-      defaultQueryTimeoutMs: 0,
-      auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, logger),
-      },
-      markOnlineOnConnect: true,
-      syncFullHistory: false,
-    });
-
-    this.sock = sock;
-    this._attachSocketListeners(sock);
-    sock.ev.on('qr', (qr) => printQR(qr));
-
-    if (!state.creds.registered) {
-      this.pairingMode = Boolean(config.phoneNumber || process.stdin.isTTY);
-      this._firstRunAnnounced = false;
-      this._pairingRefreshCount = 0;
-    }
-
-    clearTimeout(this._openWatchdog);
-    if (state.creds.registered) {
-      this._openWatchdog = setTimeout(() => {
-        if (this._closed || this.connected || !this.sock) return;
-        console.warn('⏰ Socket stuck (no open after 45s). Restarting connection...');
-        try { this.sock?.end(new Error('connect watchdog timeout')); } catch {}
-      }, OPEN_WATCHDOG_MS);
-    }
-
-    return sock;
-  }
-
-  async _handlePairingTrigger() {
-    if (this._closed || !this.sock || this.state?.creds?.registered) return;
-    if (!this.pairingMode) return;
-
-    // Rate-limit guard: after 3 refreshes, go quiet for 10 minutes
-    if (this._pairingRefreshCount >= MAX_PAIRING_REFRESHES) {
-      console.log('⏸️  WhatsApp is rate-limiting pairing requests. Waiting 10 minutes before the next code...');
-      this._pairingRefreshTimer = setTimeout(() => {
-        this._pairingRefreshCount = 0;
-        this._handlePairingTrigger();
-      }, PAIRING_QUIET_MS);
-      return;
-    }
-
-    if (!this._firstRunAnnounced) {
-      console.log('📱 No saved session found.');
-      this._firstRunAnnounced = true;
-    }
-
-    const phone = this._lastPairingPhone || config.phoneNumber;
-    if (!phone) return;
-
-    if (!isValidPhone(phone)) {
-      console.error(`❌ Invalid phone number: "${phone}". Expected 7–15 digits, country code first, no +/spaces.`);
-      return;
-    }
-    this._lastPairingPhone = phone;
-
-    const sinceLast = Date.now() - this.lastPairingRequestAt;
-    if (sinceLast < 60000) return; // min 60s between requests
-
-    // 🔑 10-second delay — requesting too early returns a dead code (#1774)
-    this.lastPairingRequestAt = Date.now();
-    await sleep(PAIRING_DELAY_MS);
-    if (this._closed || this.state?.creds?.registered || !this.sock) return;
-
     try {
-      if (this._pairingRefreshCount > 0) {
-        console.log('⚠️  PREVIOUS CODE EXPIRED — requesting a fresh one...');
-      }
-      console.log(`⚡ Requesting pairing code for ${phone}...`);
-      const code = await this.sock.requestPairingCode(phone);
-      this.pairingCode = code;
-      this._pairingRefreshCount++;
-      printPairingCode(code);
-      console.log('⏳ Waiting for you to link the device...');
-      this._startRegistrationWatcher();
-    } catch (e) {
-      console.error('❌ Pairing request failed:', e?.message || e);
-    }
-  }
+      const { state, saveCreds } = await useMultiFileAuthState(config.sessionDir);
+      const { version } = await fetchLatestBaileysVersion();
+      this.baileysVersion = version;
+      this.state = state;
 
-  _startRegistrationWatcher() {
-    this._stopRegistrationWatcher();
-    this._registrationWatcher = setInterval(() => {
-      if (this._closed) { this._stopRegistrationWatcher(); return; }
-      if (this.state?.creds?.registered) {
-        this._stopRegistrationWatcher();
-        clearTimeout(this._pairingRefreshTimer);
-        console.log('✅ Device linked successfully!');
-        this._printOnlineStatus();
-        this._joinChannel();
-      }
-    }, 5000);
-
-    this._pairingRefreshTimer = setTimeout(() => this._refreshPairingCode(), PAIRING_REFRESH_MS);
-  }
-
-  _stopRegistrationWatcher() {
-    clearInterval(this._registrationWatcher);
-    this._registrationWatcher = null;
-  }
-
-  async _refreshPairingCode() {
-    if (this._closed || this.state?.creds?.registered || !this.sock) return;
-    this._handlePairingTrigger();
-  }
-
-  _handleConnectionUpdate(update) {
-    const { connection, lastDisconnect } = update;
-
-    if (connection === 'connecting' && !this.state?.creds?.registered) {
-      this._handlePairingTrigger();
-    }
-
-    if (connection === 'open') {
-      clearTimeout(this._openWatchdog);
-      this.connected = true;
+      this.sock = makeWASocket({
+        version,
+        auth: {
+          creds: state.creds,
+          keys: makeCacheableSignalKeyStore(state.keys, logger),
+        },
+        logger,
+        printQRInTerminal: false,
+        browser: config.browser,
+        syncFullHistory: false,          // lower RAM + faster startup
+        markOnlineOnConnect: false,      // less presence spam, lower CPU
+      });
+      this._connecting = false;
       this.connectionStartedAt = Date.now();
-      this.reconnectAttempts = 0;
-      this.pairingCode = null;
 
-      if (!this.state?.creds?.registered) {
-        if (this.pairingMode) this._handlePairingTrigger();
-        return;
-      }
+      // ── Save credentials on every update (never lose session) ──
+      this.sock.ev.on('creds.update', saveCreds);
 
-      this._printOnlineStatus();
-      this._joinChannel();
-      return;
-    }
+      // ── Connection state machine ──
+      this.sock.ev.on('connection.update', (update) => this._onConnectionUpdate(update));
 
-    if (connection === 'close') {
-      clearTimeout(this._openWatchdog);
-      this.connected = false;
-      this.onlineShown = false;
-      const code = new Boom(lastDisconnect?.error)?.output?.statusCode;
-      const reason = lastDisconnect?.error?.message || `status ${code}`;
-      const wasRegistered = this.state?.creds?.registered === true;
-
-      if (code === DisconnectReason.loggedOut && wasRegistered) {
-        console.warn('❌ Logged out of WhatsApp.');
-        this._stopRegistrationWatcher();
-        clearSessions(config.sessionDir);
-        console.log('🧹 Session cleared. Restarting to request a new pairing code...');
-        this.sock?.end(undefined);
-        this.sock = null;
-        this.reconnectAttempts = 0;
-        this.channelJoined = false;
-        this._firstRunAnnounced = false;
-        setTimeout(() => this.connect(), 3000);
-        return;
-      }
-
-      if (code === DisconnectReason.loggedOut) {
-        console.log('🔌 Connection closed during pairing (not a logout). Reconnecting...');
-        this._scheduleReconnect();
-        return;
-      }
-
-      if (code === DisconnectReason.restartRequired || code === DisconnectReason.connectionReplaced) {
-        console.log('🔄 Restart required by WhatsApp. Reconnecting...');
-        this.reconnectAttempts = 0;
-        this._scheduleReconnect(1000);
-        return;
-      }
-
-      if (code === DisconnectReason.connectionClosed || code === DisconnectReason.connectionLost) {
-        console.log('🔌 Connection lost. Reconnecting...');
-      } else {
-        console.log(`🔌 Disconnected (${reason}).`);
-      }
-
+      // ── Incoming messages ──
+      this.sock.ev.on('messages.upsert', async ({ messages, type }) => {
+        if (type !== 'notify') return;
+        try { await this._handleMessages({ messages }); } catch (e) {
+          console.error('⚠️ messages.upsert handler error:', e?.stack || e?.message);
+        }
+      });
+    } catch (e) {
+      this._connecting = false;
+      console.error('⚠️ connect() error:', e?.stack || e?.message);
       this._scheduleReconnect();
     }
   }
 
-  _scheduleReconnect(delayOverride) {
-    if (this._closed || this.reconnectTimer) return;
+  // ───────────────────────── CONNECTION UPDATE ─────────────────────────
+  _onConnectionUpdate(update) {
+    const { connection, lastDisconnect, qr } = update;
 
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.error('❌ Max reconnect attempts reached. Waiting 5 minutes before retrying...');
+    if (qr) printQR(qr);
+
+    if (connection === 'connecting') {
+      this.connected = false;
+      console.log('🔄 Connecting to WhatsApp...');
+      // Watchdog: if we never reach 'open', force a reconnect
+      clearTimeout(this._openWatchdog);
+      this._openWatchdog = setTimeout(() => {
+        if (!this.connected && !this._closed) {
+          console.warn('⚠️ Open watchdog: still not connected, forcing reconnect...');
+          try { this.sock?.end(new Error('watchdog timeout')); } catch {}
+        }
+      }, OPEN_WATCHDOG_MS);
+
+      // First-run pairing: ask for number, then request the code
+      if (this.pairingMode && !this._pairingRequested) {
+        this._pairingRequested = true;
+        this._schedulePairing();
+      }
+    } else if (connection === 'open') {
+      this.connected = true;
       this.reconnectAttempts = 0;
-      this.reconnectTimer = setTimeout(() => {
-        this.reconnectTimer = null;
-        this.connect();
-      }, 300000);
+      this.pairingMode = false;
+      this._pairingRequested = false;
+      clearTimeout(this._openWatchdog);
+      this._stopPairingTimers();
+      this._startRegistrationWatcher();
+      this._printOnlineStatus();
+      this._joinChannel();
+    } else if (connection === 'close') {
+      this.connected = false;
+      this._handleConnectionClose(lastDisconnect);
+    }
+  }
+
+  // ───────────────────────── PAIRING ─────────────────────────
+  async _schedulePairing() {
+    try {
+      let phone = config.phoneNumber;
+      if (!phone) {
+        console.log('\n🔐 No session found — let\'s link your WhatsApp.');
+        console.log('📱 Enter your number in INTERNATIONAL format (digits only, no + or spaces).');
+        phone = await askPhoneNumber();
+        if (!phone) {
+          console.log('⚠️ No input received. Make sure you type the number in the console,');
+          console.log('   or set PHONE_NUMBER in .env (for hosts without a console).');
+          console.log('📌 Example: 2349066760078');
+          phone = await askPhoneNumber(300000);
+          if (!phone) {
+            console.error('❌ Pairing cancelled (no number provided). Will retry in 60s...');
+            setTimeout(() => { this._pairingRequested = false; this.connect(); }, 60000);
+            return;
+          }
+        }
+      }
+
+      if (!isValidPhone(phone)) {
+        console.error(`❌ Invalid phone number: "${phone}" — must be 7–15 digits.`);
+        this._pairingRequested = false;
+        this._scheduleReconnect(5000);
+        return;
+      }
+
+      this._phone = phone;
+      this._lastPairingPhone = phone;
+      this._pairingRefreshes = 0;
+      console.log(`📱 Pairing requested for +${phone} — waiting for the socket to be ready...`);
+
+      // Wait until the socket is in 'connecting' state before requesting the code
+      await sleep(PAIRING_DELAY_MS);
+      if (this.connected || this._closed || !this.sock) return;
+
+      await this._requestPairingCode(phone);
+    } catch (e) {
+      console.error('⚠️ Pairing flow error:', e?.stack || e?.message);
+      this._pairingRequested = false;
+    }
+  }
+
+  async _requestPairingCode(phone) {
+    if (this.connected || this._closed || !this.sock) return;
+    if (this._pairingRefreshes > MAX_PAIRING_REFRESHES) {
+      // WhatsApp rate-limits pairing requests — go quiet, keep socket alive
+      console.log(`⏸️  Pairing quiet period (${PAIRING_QUIET_MS / 60000} min) — the code above is still valid.`);
+      return;
+    }
+    try {
+      const code = await this.sock.requestPairingCode(phone);
+      this.pairingCode = code;
+      this.lastPairingRequestAt = Date.now();
+      this._pairingRefreshes++;
+      printPairingCode(code);
+      // WhatsApp sends the "Link a device" notification to the phone automatically
+
+      // Refresh the code periodically if still not linked
+      clearTimeout(this._pairingRefreshTimer);
+      this._pairingRefreshTimer = setTimeout(() => {
+        this._pairingRefreshTimer = null;
+        if (!this.connected && this.pairingMode && !this._closed) {
+          this._requestPairingCode(phone);
+        }
+      }, PAIRING_REFRESH_MS);
+    } catch (e) {
+      console.warn('⚠️ Pairing code request failed:', e?.message);
+      this._pairingRequested = false;
+      this._scheduleReconnect(5000);
+    }
+  }
+
+  _stopPairingTimers() {
+    clearTimeout(this._pairingRefreshTimer);
+    this._pairingRefreshTimer = null;
+  }
+
+  _startRegistrationWatcher() {
+    this._stopRegistrationWatcher();
+    this._registrationWatcher = (update) => {
+      if (update.registered === true) {
+        this.pairingMode = false;
+        this._stopPairingTimers();
+      }
+    };
+    try { this.sock?.ev?.on('creds.update', this._registrationWatcher); } catch {}
+  }
+
+  _stopRegistrationWatcher() {
+    if (this._registrationWatcher && this.sock?.ev) {
+      try { this.sock.ev.off('creds.update', this._registrationWatcher); } catch {}
+    }
+    this._registrationWatcher = null;
+  }
+
+  // ───────────────────────── DISCONNECT / RECONNECT ─────────────────────────
+  _handleConnectionClose(lastDisconnect) {
+    this.connected = false;
+    const error = lastDisconnect?.error;
+    const statusCode = error?.output?.statusCode;
+    const isLoggedOut = error instanceof Boom && statusCode === DisconnectReason.loggedOut;
+
+    if (isLoggedOut) {
+      console.log('🚪 Logged out of WhatsApp — clearing session and requesting a new pairing.');
+      clearSessions(config.sessionDir);
+      this.pairingMode = true;
+      this._pairingRequested = false;
+      this._phone = null;
+      this.onlineShown = false;
+      this.channelJoined = false;
+      this._scheduleReconnect(1000);
       return;
     }
 
-    const delay = delayOverride ?? Math.min(30000, 1000 * 2 ** this.reconnectAttempts);
+    const reason = statusCode ?? error?.message ?? 'unknown';
+    console.log(`🔌 Disconnected: ${reason}`);
+
+    if (statusCode === DisconnectReason.badSession) {
+      console.log('🧹 Corrupted session detected — removing only the broken files.');
+      quarantineCorruptSession(config.sessionDir);
+    }
+
+    this._scheduleReconnect();
+  }
+
+  _scheduleReconnect(delayOverride) {
+    if (this._closed) return;
+    clearTimeout(this.reconnectTimer);
+
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      console.log('🛑 Max reconnect attempts reached — resting 60s, then retrying fresh.');
+      this.reconnectAttempts = 0;
+      this.reconnectTimer = setTimeout(() => this.connect(), 60000);
+      return;
+    }
+
+    const delay = delayOverride ?? Math.min(
+      RECONNECT_MAX_DELAY,
+      RECONNECT_BASE_DELAY * 2 ** this.reconnectAttempts,
+    );
     this.reconnectAttempts++;
     console.log(`🔄 Reconnecting in ${Math.round(delay / 1000)}s (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})...`);
 
@@ -309,6 +328,7 @@ class BotController {
     }, delay);
   }
 
+  // ───────────────────────── CHANNEL AUTO-JOIN ─────────────────────────
   async _joinChannel() {
     const code = config.channelInviteCode;
     if (!code || this.channelJoined || !this.sock) return;
@@ -325,6 +345,7 @@ class BotController {
     }
   }
 
+  // ───────────────────────── ONLINE STATUS ─────────────────────────
   _printOnlineStatus() {
     if (this.onlineShown) return;
     this.onlineShown = true;
@@ -344,6 +365,7 @@ class BotController {
     console.log('');
   }
 
+  // ───────────────────────── MESSAGE HANDLING ─────────────────────────
   async _handleMessages({ messages }) {
     if (!Array.isArray(messages) || !this.sock) return;
     for (const msg of messages) {
@@ -372,6 +394,7 @@ class BotController {
     const { isPremium } = await import('../lib/database.js');
     const { getChatbotReply } = await import('../lib/ai.js');
 
+    // Chatbot: replies to plain messages when enabled (premium-gated)
     if (!text.startsWith(prefix)) {
       const db = (await import('../lib/database.js')).getDB();
       if (db.chatbotUsers?.[senderNumber] === true) {
@@ -400,6 +423,7 @@ class BotController {
     const command = args.shift()?.toLowerCase();
     if (!command) return;
 
+    // Special commands handled natively (premium redeem + chatbot toggle)
     if (command === 'chatbot' || command === 'prem' || command === 'premium') {
       const handled = await this._handleSpecialCommands(command, args, msg, from, senderNumber, isOwner);
       if (handled) return;
@@ -445,16 +469,17 @@ class BotController {
     return false;
   }
 
+  // ───────────────────────── SHUTDOWN ─────────────────────────
   shutdown(sig) {
     if (this._closed) return;
     this._closed = true;
     console.log(`\n🛑 Received ${sig}. Shutting down gracefully...`);
     this._stopRegistrationWatcher();
-    clearTimeout(this._pairingRefreshTimer);
+    this._stopPairingTimers();
     clearTimeout(this._openWatchdog);
+    clearTimeout(this.reconnectTimer);
     stopStats();
     commandLoader.stop();
-    clearTimeout(this.reconnectTimer);
     try { this.sock?.end(undefined); } catch {}
     process.exit(0);
   }
