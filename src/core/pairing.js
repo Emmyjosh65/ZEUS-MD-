@@ -9,14 +9,29 @@ export function isValidPhone(phone = '') {
   return /^\d{7,15}$/.test(phone);
 }
 
-/** Interactive prompt (TTY only: VPS/Termux/Windows). Loops until valid. */
-export function askPhoneNumber() {
+/**
+ * Interactive phone prompt.
+ * Works on TTY (VPS/Termux/Windows) AND panel consoles (Pterodactyl console).
+ * If no input arrives within timeoutMs, resolves with '' so the caller can
+ * print clear instructions instead of hanging forever (Render/Railway/Koyeb).
+ */
+export function askPhoneNumber(timeoutMs = 180000) {
   return new Promise((resolve) => {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      rl.close();
+      resolve('');
+    }, timeoutMs);
+
     const ask = () => {
       rl.question('📱 Enter WhatsApp number (international format, no +/spaces, e.g. 2349066760078): ', (answer) => {
         const phone = sanitizePhone(answer);
         if (isValidPhone(phone)) {
+          clearTimeout(timer);
+          settled = true;
           rl.close();
           return resolve(phone);
         }
