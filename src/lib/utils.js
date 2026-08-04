@@ -1,11 +1,11 @@
 import config from '../../config.js';
 
 export function formatNumber(number) {
-  return number.replace(/[^0-9]/g, '');
+  return String(number || '').replace(/[^\d]/g, '');
 }
 
 export function isOwner(senderNumber) {
-  return senderNumber === config.ownerNumber.replace(/[^0-9]/g, '');
+  return formatNumber(senderNumber) === formatNumber(config.ownerNumber);
 }
 
 export function getTimestamp() {
@@ -13,5 +13,23 @@ export function getTimestamp() {
 }
 
 export function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Extract readable text from any Baileys message type (malformed-safe). */
+export function extractText(msg) {
+  try {
+    const m = msg?.message || {};
+    return (
+      m.conversation ||
+      m.extendedTextMessage?.text ||
+      m.imageMessage?.caption ||
+      m.videoMessage?.caption ||
+      m.buttonsResponseMessage?.selectedButtonId ||
+      m.listResponseMessage?.singleSelectReply?.selectedRowId ||
+      ''
+    ).trim();
+  } catch {
+    return '';
+  }
 }
