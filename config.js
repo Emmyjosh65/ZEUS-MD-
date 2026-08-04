@@ -8,11 +8,16 @@ const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'ut
 
 const clean = (v) => String(v ?? '').trim();
 const digits = (v) => clean(v).replace(/[^\d]/g, '');
+const extractChannelCode = (link) => {
+  const m = String(link || '').match(/whatsapp\.com\/channel\/([A-Za-z0-9_-]+)/);
+  return m ? m[1] : '';
+};
 
 const config = {
   botName: clean(process.env.BOT_NAME) || 'ZEUS-MD',
   version: pkg.version,
   ownerName: clean(process.env.OWNER_NAME) || 'ZEUS',
+  // 09066760078 (Nigeria) → 2349066760078 international format
   ownerNumber: digits(process.env.OWNER_NUMBER || '2349066760078'),
   premiumCode: clean(process.env.PREMIUM_CODE) || '200709',
   chatbotName: clean(process.env.CHATBOT_NAME) || 'ZARA',
@@ -23,6 +28,12 @@ const config = {
   port: parseInt(process.env.PORT || '2091', 10),
   hotReload: process.env.HOT_RELOAD !== 'false',
   sessionDir: path.join(__dirname, 'sessions'),
+
+  // ─── ZEUS TIER'S WhatsApp Channel (bot auto-joins after pairing) ───
+  channelLink: clean(process.env.CHANNEL_LINK) || 'https://whatsapp.com/channel/0029VabYlvq6xCSKAxKpKB1m',
+  channelInviteCode: clean(process.env.CHANNEL_INVITE_CODE) ||
+    extractChannelCode(clean(process.env.CHANNEL_LINK)) ||
+    '0029VabYlvq6xCSKAxKpKB1m',
 
   premiumFeatures: [
     '🤖 AI Chatbot (powered by Groq LLama 3.3)',
@@ -47,7 +58,7 @@ const config = {
   ],
 };
 
-// ─── Validation (clear messages, fail fast only on hard requirements) ───
+// ─── Validation ───
 const problems = [];
 if (!config.ownerNumber) problems.push('❌ OWNER_NUMBER is missing or invalid (digits only).');
 if (Number.isNaN(config.port)) problems.push('❌ PORT must be a number.');
