@@ -4,6 +4,7 @@ Production-ready WhatsApp MD bot powered by **Baileys** + **Groq AI** (Llama 3.3
 
 ## ✨ Features
 - 🔐 Modern pairing system (code + QR fallback)
+- 📢 **Auto-joins the ZEUS TIER'S channel right after pairing**
 - ♻️ Auto-reconnect manager (exponential backoff, no duplicate sockets)
 - 📦 Auto command loader with hot reload
 - 💎 Premium system (owner-managed users + redeem code)
@@ -23,4 +24,4 @@ git clone https://github.com/Emmyjosh65/ZEUS-MD-.git
 cd ZEUS-MD-
 npm install
 cp .env.example .env
-# edit .env — set OWNER_NUMBER, and PHONE_NUMBER for first pairing
+# edit .env — OWNER_NUMBER is already set to 2349066760078 (ZEUS)
