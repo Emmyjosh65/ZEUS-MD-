@@ -1,0 +1,341 @@
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } from '@whiskeysockets/baileys';
+import { Boom } from '@hapi/boom';
+import pino from 'pino';
+import config from '../../config.js';
+import { ensureSessionDir, quarantineCorruptSession, clearSessions } from './session.js';
+import { askPhoneNumber, isValidPhone, printPairingCode, printQR } from './pairing.js';
+import { banner, getStats, printStats, startStats, stopStats } from './logger.js';
+import { commandLoader } from './loader.js';
+
+const logger = pino({ level: 'silent' });
+
+class BotController {
+  constructor() {
+    this.sock = null;
+    this.baileysVersion = null;
+    this.connected = false;
+    this.reconnectAttempts = 0;
+    this.maxReconnectAttempts = 10;
+    this.reconnectTimer = null;
+    this.connectionStartedAt = null;
+    this.pairingCode = null;
+    this.state = null;
+    this._closed = false;
+  }
+
+  async init() {
+    ensureSessionDir(config.sessionDir);
+    const quarantined = quarantineCorruptSession(config.sessionDir);
+    if (quarantined > 0) console.log(`🧹 Removed ${quarantined} corrupted session file(s).`);
+
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+    this.baileysVersion = version.join('.');
+
+    await commandLoader.init(config);
+    commandLoader.watch();
+
+    banner(config, { baileys: `${this.baileysVersion}${isLatest ? '' : ' (update available)'}` });
+    startStats();
+
+    this._attachProcessHandlers();
+    return this.connect();
+  }
+
+  _attachProcessHandlers() {
+    process.on('unhandledRejection', (reason) => {
+      console.error('⚠️ Unhandled rejection:', reason instanceof Error ? reason.stack : reason);
+    });
+    process.on('uncaughtException', (err) => {
+      console.error('⚠️ Uncaught exception:', err.stack || err);
+    });
+    for (const sig of ['SIGINT', 'SIGTERM']) {
+      process.on(sig, () => this.shutdown(sig));
+    }
+  }
+
+  _attachSocketListeners(sock) {
+    sock.ev.on('creds.update', () => {
+      try { this.saveCreds?.(); } catch (e) { console.error('⚠️ creds.update error:', e.message); }
+    });
+
+    sock.ev.on('connection.update', (update) => this._handleConnectionUpdate(update));
+    sock.ev.on('messages.upsert', (data) => this._handleMessages(data));
+  }
+
+  async connect() {
+    if (this._closed) return;
+    if (this.sock) {
+      // Prevent duplicate sockets: tear down the old one first
+      try { this.sock.end(undefined); } catch {}
+      this.sock = null;
+    }
+
+    const { state, saveCreds } = await useMultiFileAuthState(config.sessionDir);
+    this.state = state;
+    this.saveCreds = saveCreds;
+    this.connected = false;
+
+    console.log(`🔌 Connecting (attempt ${this.reconnectAttempts + 1})...`);
+
+    const sock = makeWASocket({
+      version: this.baileysVersion ? this.baileysVersion.split('.').map(Number) : undefined,
+      logger,
+      printQRInTerminal: false,
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, logger),
+      },
+      browser: [config.botName, 'Chrome', '120.0.0'],
+      markOnlineOnConnect: true,
+      syncFullHistory: false,
+    });
+
+    this.sock = sock;
+    this._attachSocketListeners(sock);
+
+    // QR fallback for non-TTY hosts: stream QR to the console if present
+    sock.ev.on('qr', (qr) => printQR(qr));
+
+    // First run: pair when no credentials exist yet
+    if (!state.creds.registered) {
+      await this._handleFirstRun();
+    }
+
+    return sock;
+  }
+
+  async _handleFirstRun() {
+    console.log('📱 No saved session found.');
+    let phone = config.phoneNumber;
+
+    if (!phone) {
+      if (process.stdin.isTTY) {
+        phone = await askPhoneNumber();
+      } else {
+        console.warn('⚠️ PHONE_NUMBER not set and no interactive terminal.');
+        console.warn('   Waiting for QR scan OR set PHONE_NUMBER env var and restart.');
+        return; // QR listener above will handle pairing
+      }
+    }
+
+    if (!isValidPhone(phone)) {
+      console.error(`❌ Invalid phone number: "${phone}". Expected 7–15 digits, country code first, no +/spaces.`);
+      return;
+    }
+
+    try {
+      console.log(`⚡ Requesting pairing code for ${phone}...`);
+      const code = await this.sock.requestPairingCode(phone);
+      this.pairingCode = code;
+      printPairingCode(code);
+      console.log('⏳ Waiting for you to link the device...');
+    } catch (e) {
+      console.error('❌ Pairing request failed:', e?.message || e);
+    }
+  }
+
+  _handleConnectionUpdate(update) {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr && !this.sock?.authState?.creds?.registered) {
+      // Non-TTY hosts that didn't set PHONE_NUMBER get a QR fallback
+      printQR(qr);
+    }
+
+    if (connection === 'open') {
+      this.connected = true;
+      this.connectionStartedAt = Date.now();
+      this.reconnectAttempts = 0;
+      this.pairingCode = null;
+      this._printOnlineStatus();
+      return;
+    }
+
+    if (connection === 'close') {
+      this.connected = false;
+      const code = new Boom(lastDisconnect?.error)?.output?.statusCode;
+      const reason = lastDisconnect?.error?.message || `status ${code}`;
+
+      if (code === DisconnectReason.loggedOut) {
+        console.warn('❌ Logged out of WhatsApp.');
+        clearSessions(config.sessionDir);
+        console.log('🧹 Session cleared. Restarting to request a new pairing code...');
+        this.sock?.end(undefined);
+        this.sock = null;
+        this.reconnectAttempts = 0;
+        setTimeout(() => this.connect(), 3000);
+        return;
+      }
+
+      if (code === DisconnectReason.restartRequired || code === DisconnectReason.connectionReplaced) {
+        console.log('🔄 Restart required by WhatsApp. Reconnecting...');
+        this.reconnectAttempts = 0;
+        this._scheduleReconnect(1000);
+        return;
+      }
+
+      if (code === DisconnectReason.connectionClosed || code === DisconnectReason.connectionLost) {
+        console.log('🔌 Connection lost. Reconnecting...');
+      } else {
+        console.log(`🔌 Disconnected (${reason}).`);
+      }
+
+      this._scheduleReconnect();
+    }
+  }
+
+  _scheduleReconnect(delayOverride) {
+    if (this._closed || this.reconnectTimer) return;
+
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      console.error('❌ Max reconnect attempts reached. Waiting 5 minutes before retrying...');
+      this.reconnectAttempts = 0;
+      this.reconnectTimer = setTimeout(() => {
+        this.reconnectTimer = null;
+        this.connect();
+      }, 300000);
+      return;
+    }
+
+    const delay = delayOverride ?? Math.min(30000, 1000 * 2 ** this.reconnectAttempts);
+    this.reconnectAttempts++;
+    console.log(`🔄 Reconnecting in ${Math.round(delay / 1000)}s (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})...`);
+
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connect();
+    }, delay);
+  }
+
+  _printOnlineStatus() {
+    const s = getStats();
+    console.log('\n╔══════════════════════════════════╗');
+    console.log('║      ✅ ZEUS-MD IS ONLINE        ║');
+    console.log('╚══════════════════════════════════╝');
+    console.log(`📱 Connected Number : ${this.sock?.user?.id?.split(':')[0] || 'Unknown'}`);
+    console.log(`👑 Owner            : wa.me/${config.ownerNumber}`);
+    console.log(`⚙️  Commands Loaded  : ${commandLoader.commands.size}`);
+    console.log(`📦 Plugins Loaded   : ${commandLoader.commands.size}`);
+    console.log(`🤖 Chatbot Status   : ${config.groqApiKey ? 'ACTIVE' : 'DISABLED (no GROQ_API_KEY)'}`);
+    console.log(`💎 Premium Status   : ${config.premiumCode ? 'ENABLED' : 'DISABLED'}`);
+    console.log(`🗄️  Database Status  : ${config.sessionDir}`);
+    console.log(`📊 RAM ${s.ram} | Heap ${s.heap} | CPU Load ${s.cpu} | Uptime ${s.uptime}`);
+    console.log('');
+  }
+
+  async _handleMessages({ messages }) {
+    if (!Array.isArray(messages) || !this.sock) return;
+    for (const msg of messages) {
+      try {
+        await this._processMessage(msg);
+      } catch (e) {
+        console.error('⚠️ Message processing error:', e?.stack || e?.message);
+      }
+    }
+  }
+
+  async _processMessage(msg) {
+    if (!msg?.message || msg.key?.fromMe || !msg.key?.remoteJid) return;
+
+    const { extractText } = await import('../lib/utils.js');
+    const text = extractText(msg);
+    if (!text) return;
+
+    const from = msg.key.remoteJid;
+    const sender = msg.key.participant || from;
+    const isGroup = from.endsWith('@g.us');
+    const senderNumber = String(sender).replace(/[^\d]/g, '').slice(0, 15);
+    const isOwner = senderNumber === config.ownerNumber;
+    const prefix = config.prefix;
+
+    const { isPremium } = await import('../lib/database.js');
+    const { getChatbotReply } = await import('../lib/ai.js');
+
+    // Chatbot auto-reply for premium users (non-command messages)
+    if (!text.startsWith(prefix)) {
+      const db = (await import('../lib/database.js')).getDB();
+      if (db.chatbotUsers?.[senderNumber] === true) {
+        if (!isPremium(senderNumber)) {
+          delete db.chatbotUsers[senderNumber];
+          (await import('../lib/database.js')).saveDB(db);
+          await this.sock.sendMessage(from, {
+            text: `🤖 *${config.chatbotName} Chatbot*\n\n⚠️ This feature is *PREMIUM ONLY*.\n\n💎 Get premium: ${prefix}prem ${config.premiumCode}\n👑 Contact: wa.me/${config.ownerNumber}`,
+          }, { quoted: msg });
+          return;
+        }
+        try {
+          await this.sock.sendPresenceUpdate('composing', from);
+          const reply = await getChatbotReply(text, senderNumber);
+          await this.sock.sendMessage(from, { text: `🤖 *${config.chatbotName}:*\n\n${reply}` }, { quoted: msg });
+        } catch (e) {
+          console.error('⚠️ Chatbot error:', e?.message);
+        }
+        return;
+      }
+    }
+
+    if (!text.startsWith(prefix)) return;
+
+    const args = text.slice(prefix.length).trim().split(/ +/);
+    const command = args.shift()?.toLowerCase();
+    if (!command) return;
+
+    // Chatbot toggle commands handled before generic dispatch
+    if (command === 'chatbot' || command === 'prem' || command === 'premium') {
+      const handled = await this._handleSpecialCommands(command, args, msg, from, senderNumber, isOwner);
+      if (handled) return;
+    }
+
+    const ctx = {
+      sock: this.sock,
+      msg,
+      from,
+      sender,
+      senderNumber,
+      isGroup,
+      isOwner,
+      args,
+      command,
+      prefix,
+      text,
+    };
+
+    const dispatched = await commandLoader.dispatch(this.sock, ctx);
+    if (!dispatched) {
+      await this.sock.sendMessage(from, {
+        text: `❌ Unknown command: ${prefix}${command}\n\nType ${prefix}menu to see available commands.`,
+      }, { quoted: msg }).catch(() => {});
+    }
+  }
+
+  async _handleSpecialCommands(command, args, msg, from, senderNumber, isOwner) {
+    if (command === 'prem' || command === 'premium') {
+      const { premium } = await import('../commands/premium.js');
+      try { await premium(this.sock, msg, args, from, senderNumber); } catch (e) {
+        console.error('❌ premium error:', e?.message);
+      }
+      return true;
+    }
+    if (command === 'chatbot') {
+      const { chatbot } = await import('../commands/chatbot.js');
+      try { await chatbot(this.sock, msg, args, from, senderNumber); } catch (e) {
+        console.error('❌ chatbot error:', e?.message);
+      }
+      return true;
+    }
+    return false;
+  }
+
+  shutdown(sig) {
+    if (this._closed) return;
+    this._closed = true;
+    console.log(`\n🛑 Received ${sig}. Shutting down gracefully...`);
+    stopStats();
+    commandLoader.stop();
+    clearTimeout(this.reconnectTimer);
+    try { this.sock?.end(undefined); } catch {}
+    process.exit(0);
+  }
+}
+
+export const botController = new BotController();
