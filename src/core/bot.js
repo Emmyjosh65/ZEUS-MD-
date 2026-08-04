@@ -10,7 +10,9 @@ import { commandLoader } from './loader.js';
 const logger = pino({ level: 'silent' });
 const PAIRING_COOLDOWN_MS = 60000;   // min time between pairing code requests
 const PAIRING_REFRESH_MS = 90000;    // auto-issue a fresh code if still not linked
-const OPEN_WAIT_MS = 20000;          // max time to wait for socket open
+const PAIRING_DELAY_MS = 5000;       // let the socket fully establish before requesting
+const OPEN_WATCHDOG_MS = 45000;      // registered sessions: force-restart if 'open' never fires
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 class BotController {
   constructor() {
@@ -31,6 +33,7 @@ class BotController {
     this._firstRunAnnounced = false;
     this._pairingRefreshTimer = null;
     this._registrationWatcher = null;
+    this._openWatchdog = null;
     this._closed = false;
   }
 
@@ -93,6 +96,7 @@ class BotController {
       version: this.baileysVersion ? this.baileysVersion.split('.').map(Number) : undefined,
       logger,
       printQRInTerminal: false,
+      connectTimeoutMs: 60000,
       auth: {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore(state.keys, logger),
@@ -105,45 +109,39 @@ class BotController {
     this.sock = sock;
     this._attachSocketListeners(sock);
 
-    // QR fallback (only used when there's no PHONE_NUMBER and no TTY)
+    // QR fallback (used only when there's no PHONE_NUMBER at all)
     sock.ev.on('qr', (qr) => printQR(qr));
 
-    // Decide pairing strategy once per connection
     if (!state.creds.registered) {
       this.pairingMode = Boolean(config.phoneNumber || process.stdin.isTTY);
+      this._firstRunAnnounced = false;
+    }
+
+    // Watchdog: for an ALREADY REGISTERED session, 'open' must arrive soon.
+    // A brand-new session never fires 'open' (it waits on QR/pairing), so skip it.
+    clearTimeout(this._openWatchdog);
+    if (state.creds.registered) {
+      this._openWatchdog = setTimeout(() => {
+        if (this._closed || this.connected || !this.sock) return;
+        console.warn('⏰ Socket stuck (no open after 45s). Restarting connection...');
+        try { this.sock?.end(new Error('connect watchdog timeout')); } catch {}
+      }, OPEN_WATCHDOG_MS);
     }
 
     return sock;
   }
 
-  async _waitForOpen(timeoutMs = OPEN_WAIT_MS) {
-    if (this.connected || this.state?.creds?.registered) return true;
-    try {
-      await this.sock.waitForConnectionUpdate((u) => u.connection === 'open', timeoutMs);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  async _handleFirstRun() {
-    if (this._closed || !this.sock) return;
+  async _handlePairingTrigger() {
+    if (this._closed || !this.sock || this.state?.creds?.registered) return;
+    if (!this.pairingMode) return; // QR-only mode
 
     if (!this._firstRunAnnounced) {
       console.log('📱 No saved session found.');
       this._firstRunAnnounced = true;
     }
 
-    let phone = config.phoneNumber;
-    if (!phone) {
-      if (process.stdin.isTTY) {
-        phone = await askPhoneNumber();
-      } else {
-        console.warn('⚠️ PHONE_NUMBER not set and no interactive terminal.');
-        console.warn('   Waiting for QR scan OR set PHONE_NUMBER env var and restart.');
-        return; // QR listener handles pairing
-      }
-    }
+    const phone = this._lastPairingPhone || config.phoneNumber;
+    if (!phone) return;
 
     if (!isValidPhone(phone)) {
       console.error(`❌ Invalid phone number: "${phone}". Expected 7–15 digits, country code first, no +/spaces.`);
@@ -151,22 +149,17 @@ class BotController {
     }
     this._lastPairingPhone = phone;
 
-    // Never request a code before the socket is actually open
-    const open = await this._waitForOpen();
-    if (!open || this._closed || !this.sock) {
-      console.log('⏳ Socket not ready yet — will request a pairing code when connected.');
-      return;
-    }
-
     // Cooldown: stop the request-spam loop
     const sinceLast = Date.now() - this.lastPairingRequestAt;
-    if (sinceLast < PAIRING_COOLDOWN_MS) {
-      console.log(`⏳ Waiting ${Math.ceil((PAIRING_COOLDOWN_MS - sinceLast) / 1000)}s before requesting a new pairing code...`);
-      return;
-    }
+    if (sinceLast < PAIRING_COOLDOWN_MS) return;
+
+    // Give the socket a moment to fully establish — requesting too early
+    // causes Baileys "Connection Closed" (428) errors
+    this.lastPairingRequestAt = Date.now();
+    await sleep(PAIRING_DELAY_MS);
+    if (this._closed || this.state?.creds?.registered || !this.sock) return;
 
     try {
-      this.lastPairingRequestAt = Date.now();
       console.log(`⚡ Requesting pairing code for ${phone}...`);
       const code = await this.sock.requestPairingCode(phone);
       this.pairingCode = code;
@@ -221,14 +214,22 @@ class BotController {
   _handleConnectionUpdate(update) {
     const { connection, lastDisconnect } = update;
 
+    // 🔑 KEY FIX: Baileys never emits 'open' for a new device — the pairing
+    // code must be requested during the 'connecting'/QR phase instead.
+    if (connection === 'connecting' && !this.state?.creds?.registered) {
+      this._handlePairingTrigger();
+    }
+
     if (connection === 'open') {
+      clearTimeout(this._openWatchdog);
       this.connected = true;
       this.connectionStartedAt = Date.now();
       this.reconnectAttempts = 0;
       this.pairingCode = null;
 
       if (!this.state?.creds?.registered) {
-        if (this.pairingMode) this._handleFirstRun();
+        // Fallback for Baileys builds that do fire 'open' before pairing
+        if (this.pairingMode) this._handlePairingTrigger();
         return;
       }
 
@@ -238,6 +239,7 @@ class BotController {
     }
 
     if (connection === 'close') {
+      clearTimeout(this._openWatchdog);
       this.connected = false;
       this.onlineShown = false;
       const code = new Boom(lastDisconnect?.error)?.output?.statusCode;
@@ -450,6 +452,7 @@ class BotController {
     console.log(`\n🛑 Received ${sig}. Shutting down gracefully...`);
     this._stopRegistrationWatcher();
     clearTimeout(this._pairingRefreshTimer);
+    clearTimeout(this._openWatchdog);
     stopStats();
     commandLoader.stop();
     clearTimeout(this.reconnectTimer);
