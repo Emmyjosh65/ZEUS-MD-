@@ -4,10 +4,13 @@ import pino from 'pino';
 import config from '../../config.js';
 import { ensureSessionDir, quarantineCorruptSession, clearSessions } from './session.js';
 import { askPhoneNumber, isValidPhone, printPairingCode, printQR } from './pairing.js';
-import { banner, getStats, printStats, startStats, stopStats } from './logger.js';
+import { banner, getStats, startStats, stopStats } from './logger.js';
 import { commandLoader } from './loader.js';
 
 const logger = pino({ level: 'silent' });
+const PAIRING_COOLDOWN_MS = 60000;   // min time between pairing code requests
+const PAIRING_REFRESH_MS = 90000;    // auto-issue a fresh code if still not linked
+const OPEN_WAIT_MS = 20000;          // max time to wait for socket open
 
 class BotController {
   constructor() {
@@ -21,6 +24,13 @@ class BotController {
     this.pairingCode = null;
     this.state = null;
     this.channelJoined = false;
+    this.pairingMode = false;
+    this.onlineShown = false;
+    this.lastPairingRequestAt = 0;
+    this._lastPairingPhone = '';
+    this._firstRunAnnounced = false;
+    this._pairingRefreshTimer = null;
+    this._registrationWatcher = null;
     this._closed = false;
   }
 
@@ -75,6 +85,7 @@ class BotController {
     this.state = state;
     this.saveCreds = saveCreds;
     this.connected = false;
+    this.onlineShown = false;
 
     console.log(`🔌 Connecting (attempt ${this.reconnectAttempts + 1})...`);
 
@@ -94,28 +105,43 @@ class BotController {
     this.sock = sock;
     this._attachSocketListeners(sock);
 
-    // QR fallback for non-TTY hosts: stream QR to the console if present
+    // QR fallback (only used when there's no PHONE_NUMBER and no TTY)
     sock.ev.on('qr', (qr) => printQR(qr));
 
-    // First run: pair when no credentials exist yet
+    // Decide pairing strategy once per connection
     if (!state.creds.registered) {
-      await this._handleFirstRun();
+      this.pairingMode = Boolean(config.phoneNumber || process.stdin.isTTY);
     }
 
     return sock;
   }
 
-  async _handleFirstRun() {
-    console.log('📱 No saved session found.');
-    let phone = config.phoneNumber;
+  async _waitForOpen(timeoutMs = OPEN_WAIT_MS) {
+    if (this.connected || this.state?.creds?.registered) return true;
+    try {
+      await this.sock.waitForConnectionUpdate((u) => u.connection === 'open', timeoutMs);
+      return true;
+    } catch {
+      return false;
+    }
+  }
 
+  async _handleFirstRun() {
+    if (this._closed || !this.sock) return;
+
+    if (!this._firstRunAnnounced) {
+      console.log('📱 No saved session found.');
+      this._firstRunAnnounced = true;
+    }
+
+    let phone = config.phoneNumber;
     if (!phone) {
       if (process.stdin.isTTY) {
         phone = await askPhoneNumber();
       } else {
         console.warn('⚠️ PHONE_NUMBER not set and no interactive terminal.');
         console.warn('   Waiting for QR scan OR set PHONE_NUMBER env var and restart.');
-        return; // QR listener above will handle pairing
+        return; // QR listener handles pairing
       }
     }
 
@@ -123,51 +149,120 @@ class BotController {
       console.error(`❌ Invalid phone number: "${phone}". Expected 7–15 digits, country code first, no +/spaces.`);
       return;
     }
+    this._lastPairingPhone = phone;
+
+    // Never request a code before the socket is actually open
+    const open = await this._waitForOpen();
+    if (!open || this._closed || !this.sock) {
+      console.log('⏳ Socket not ready yet — will request a pairing code when connected.');
+      return;
+    }
+
+    // Cooldown: stop the request-spam loop
+    const sinceLast = Date.now() - this.lastPairingRequestAt;
+    if (sinceLast < PAIRING_COOLDOWN_MS) {
+      console.log(`⏳ Waiting ${Math.ceil((PAIRING_COOLDOWN_MS - sinceLast) / 1000)}s before requesting a new pairing code...`);
+      return;
+    }
 
     try {
+      this.lastPairingRequestAt = Date.now();
       console.log(`⚡ Requesting pairing code for ${phone}...`);
       const code = await this.sock.requestPairingCode(phone);
       this.pairingCode = code;
       printPairingCode(code);
       console.log('⏳ Waiting for you to link the device...');
+      this._startRegistrationWatcher();
     } catch (e) {
       console.error('❌ Pairing request failed:', e?.message || e);
+      // The close handler reconnects; the cooldown prevents an instant retry loop.
+    }
+  }
+
+  _startRegistrationWatcher() {
+    this._stopRegistrationWatcher();
+    this._registrationWatcher = setInterval(() => {
+      if (this._closed) { this._stopRegistrationWatcher(); return; }
+      if (this.state?.creds?.registered) {
+        this._stopRegistrationWatcher();
+        clearTimeout(this._pairingRefreshTimer);
+        console.log('✅ Device linked successfully!');
+        this._printOnlineStatus();
+        this._joinChannel();
+      }
+    }, 5000);
+
+    // Auto-refresh: if still unlinked, issue a fresh code (old one likely expired)
+    this._pairingRefreshTimer = setTimeout(() => this._refreshPairingCode(), PAIRING_REFRESH_MS);
+  }
+
+  _stopRegistrationWatcher() {
+    clearInterval(this._registrationWatcher);
+    this._registrationWatcher = null;
+  }
+
+  async _refreshPairingCode() {
+    if (this._closed || this.state?.creds?.registered || !this.sock) return;
+    const phone = this._lastPairingPhone || config.phoneNumber;
+    if (!phone) return;
+    console.log('🔁 No link detected yet — previous code may have expired. Requesting a fresh one...');
+    try {
+      const code = await this.sock.requestPairingCode(phone);
+      this.lastPairingRequestAt = Date.now();
+      this.pairingCode = code;
+      printPairingCode(code);
+      this._startRegistrationWatcher();
+    } catch (e) {
+      console.error('❌ Pairing refresh failed:', e?.message || e);
+      this._pairingRefreshTimer = setTimeout(() => this._refreshPairingCode(), PAIRING_REFRESH_MS);
     }
   }
 
   _handleConnectionUpdate(update) {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr && !this.sock?.authState?.creds?.registered) {
-      // Non-TTY hosts that didn't set PHONE_NUMBER get a QR fallback
-      printQR(qr);
-    }
+    const { connection, lastDisconnect } = update;
 
     if (connection === 'open') {
       this.connected = true;
       this.connectionStartedAt = Date.now();
       this.reconnectAttempts = 0;
       this.pairingCode = null;
+
+      if (!this.state?.creds?.registered) {
+        if (this.pairingMode) this._handleFirstRun();
+        return;
+      }
+
       this._printOnlineStatus();
-      // ─── AUTO-JOIN CHANNEL after pairing/connection ───
       this._joinChannel();
       return;
     }
 
     if (connection === 'close') {
       this.connected = false;
+      this.onlineShown = false;
       const code = new Boom(lastDisconnect?.error)?.output?.statusCode;
       const reason = lastDisconnect?.error?.message || `status ${code}`;
+      const wasRegistered = this.state?.creds?.registered === true;
 
-      if (code === DisconnectReason.loggedOut) {
+      // ─── REAL logout — only possible if we had a working session ───
+      if (code === DisconnectReason.loggedOut && wasRegistered) {
         console.warn('❌ Logged out of WhatsApp.');
+        this._stopRegistrationWatcher();
         clearSessions(config.sessionDir);
         console.log('🧹 Session cleared. Restarting to request a new pairing code...');
         this.sock?.end(undefined);
         this.sock = null;
         this.reconnectAttempts = 0;
         this.channelJoined = false;
+        this._firstRunAnnounced = false;
         setTimeout(() => this.connect(), 3000);
+        return;
+      }
+
+      // ─── 401 during pairing is NOT a logout — never wipe the session folder ───
+      if (code === DisconnectReason.loggedOut) {
+        console.log('🔌 Connection closed during pairing (not a logout). Reconnecting...');
+        this._scheduleReconnect();
         return;
       }
 
@@ -185,26 +280,6 @@ class BotController {
       }
 
       this._scheduleReconnect();
-    }
-  }
-
-  /**
-   * Auto-join the owner's WhatsApp channel once per session.
-   * Flow: resolve invite code → JID, then follow the channel.
-   */
-  async _joinChannel() {
-    const code = config.channelInviteCode;
-    if (!code || this.channelJoined || !this.sock) return;
-    this.channelJoined = true;
-    try {
-      const meta = await this.sock.newsletterMetadata('invite', code);
-      const jid = meta?.id || meta?.jid;
-      if (!jid) throw new Error('channel invite code could not be resolved');
-      await this.sock.newsletterFollow(jid);
-      console.log(`📣 Auto-joined channel: ${meta?.name || config.channelLink}`);
-    } catch (e) {
-      console.warn(`⚠️ Could not auto-join channel (${e?.message || e}). The bot continues normally.`);
-      this.channelJoined = false; // retry on next connection open
     }
   }
 
@@ -231,7 +306,25 @@ class BotController {
     }, delay);
   }
 
+  async _joinChannel() {
+    const code = config.channelInviteCode;
+    if (!code || this.channelJoined || !this.sock) return;
+    this.channelJoined = true;
+    try {
+      const meta = await this.sock.newsletterMetadata('invite', code);
+      const jid = meta?.id || meta?.jid;
+      if (!jid) throw new Error('channel invite code could not be resolved');
+      await this.sock.newsletterFollow(jid);
+      console.log(`📣 Auto-joined channel: ${meta?.name || config.channelLink}`);
+    } catch (e) {
+      console.warn(`⚠️ Could not auto-join channel (${e?.message || e}). The bot continues normally.`);
+      this.channelJoined = false; // retry on next connection open
+    }
+  }
+
   _printOnlineStatus() {
+    if (this.onlineShown) return;
+    this.onlineShown = true;
     const s = getStats();
     console.log('\n╔══════════════════════════════════╗');
     console.log('║      ✅ ZEUS-MD IS ONLINE        ║');
@@ -355,6 +448,8 @@ class BotController {
     if (this._closed) return;
     this._closed = true;
     console.log(`\n🛑 Received ${sig}. Shutting down gracefully...`);
+    this._stopRegistrationWatcher();
+    clearTimeout(this._pairingRefreshTimer);
     stopStats();
     commandLoader.stop();
     clearTimeout(this.reconnectTimer);
