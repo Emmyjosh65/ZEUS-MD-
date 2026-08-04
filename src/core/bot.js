@@ -1,17 +1,22 @@
 import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
+import { createRequire } from 'module';
 import config from '../../config.js';
 import { ensureSessionDir, quarantineCorruptSession, clearSessions } from './session.js';
 import { askPhoneNumber, isValidPhone, printPairingCode, printQR } from './pairing.js';
 import { banner, getStats, startStats, stopStats } from './logger.js';
 import { commandLoader } from './loader.js';
 
+const require = createRequire(import.meta.url);
 const logger = pino({ level: 'silent' });
-const PAIRING_COOLDOWN_MS = 60000;   // min time between pairing code requests
-const PAIRING_REFRESH_MS = 90000;    // auto-issue a fresh code if still not linked
-const PAIRING_DELAY_MS = 5000;       // let the socket fully establish before requesting
-const OPEN_WATCHDOG_MS = 45000;      // registered sessions: force-restart if 'open' never fires
+
+// ─── Pairing tuning (community-verified values) ───
+const PAIRING_DELAY_MS = 10000;        // wait 10s after 'connecting' before requesting code (#1774)
+const PAIRING_REFRESH_MS = 60000;      // refresh code every 60s if still unlinked
+const MAX_PAIRING_REFRESHES = 3;       // max 3 refreshes, then go quiet (WhatsApp rate-limit)
+const PAIRING_QUIET_MS = 600000;       // 10 min quiet before allowing another attempt
+const OPEN_WATCHDOG_MS = 45000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 class BotController {
@@ -34,6 +39,7 @@ class BotController {
     this._pairingRefreshTimer = null;
     this._registrationWatcher = null;
     this._openWatchdog = null;
+    this._pairingRefreshCount = 0;
     this._closed = false;
   }
 
@@ -44,6 +50,10 @@ class BotController {
 
     const { version, isLatest } = await fetchLatestBaileysVersion();
     this.baileysVersion = version.join('.');
+
+    try {
+      console.log(`📦 Baileys package: ${require('@whiskeysockets/baileys/package.json').version}`);
+    } catch {}
 
     await commandLoader.init(config);
     commandLoader.watch();
@@ -71,7 +81,6 @@ class BotController {
     sock.ev.on('creds.update', () => {
       try { this.saveCreds?.(); } catch (e) { console.error('⚠️ creds.update error:', e.message); }
     });
-
     sock.ev.on('connection.update', (update) => this._handleConnectionUpdate(update));
     sock.ev.on('messages.upsert', (data) => this._handleMessages(data));
   }
@@ -79,7 +88,6 @@ class BotController {
   async connect() {
     if (this._closed) return;
     if (this.sock) {
-      // Prevent duplicate sockets: tear down the old one first
       try { this.sock.end(undefined); } catch {}
       this.sock = null;
     }
@@ -97,28 +105,28 @@ class BotController {
       logger,
       printQRInTerminal: false,
       connectTimeoutMs: 60000,
+      // 🔑 Known-good browser config — fixes pairing silently failing (#1242, #636)
+      browser: ['Chrome (Linux)', '', ''],
+      // 🔑 Fixes "Connection Closed" while requesting pairing code (#390)
+      defaultQueryTimeoutMs: 0,
       auth: {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore(state.keys, logger),
       },
-      browser: [config.botName, 'Chrome', '120.0.0'],
       markOnlineOnConnect: true,
       syncFullHistory: false,
     });
 
     this.sock = sock;
     this._attachSocketListeners(sock);
-
-    // QR fallback (used only when there's no PHONE_NUMBER at all)
     sock.ev.on('qr', (qr) => printQR(qr));
 
     if (!state.creds.registered) {
       this.pairingMode = Boolean(config.phoneNumber || process.stdin.isTTY);
       this._firstRunAnnounced = false;
+      this._pairingRefreshCount = 0;
     }
 
-    // Watchdog: for an ALREADY REGISTERED session, 'open' must arrive soon.
-    // A brand-new session never fires 'open' (it waits on QR/pairing), so skip it.
     clearTimeout(this._openWatchdog);
     if (state.creds.registered) {
       this._openWatchdog = setTimeout(() => {
@@ -133,7 +141,17 @@ class BotController {
 
   async _handlePairingTrigger() {
     if (this._closed || !this.sock || this.state?.creds?.registered) return;
-    if (!this.pairingMode) return; // QR-only mode
+    if (!this.pairingMode) return;
+
+    // Rate-limit guard: after 3 refreshes, go quiet for 10 minutes
+    if (this._pairingRefreshCount >= MAX_PAIRING_REFRESHES) {
+      console.log('⏸️  WhatsApp is rate-limiting pairing requests. Waiting 10 minutes before the next code...');
+      this._pairingRefreshTimer = setTimeout(() => {
+        this._pairingRefreshCount = 0;
+        this._handlePairingTrigger();
+      }, PAIRING_QUIET_MS);
+      return;
+    }
 
     if (!this._firstRunAnnounced) {
       console.log('📱 No saved session found.');
@@ -149,26 +167,27 @@ class BotController {
     }
     this._lastPairingPhone = phone;
 
-    // Cooldown: stop the request-spam loop
     const sinceLast = Date.now() - this.lastPairingRequestAt;
-    if (sinceLast < PAIRING_COOLDOWN_MS) return;
+    if (sinceLast < 60000) return; // min 60s between requests
 
-    // Give the socket a moment to fully establish — requesting too early
-    // causes Baileys "Connection Closed" (428) errors
+    // 🔑 10-second delay — requesting too early returns a dead code (#1774)
     this.lastPairingRequestAt = Date.now();
     await sleep(PAIRING_DELAY_MS);
     if (this._closed || this.state?.creds?.registered || !this.sock) return;
 
     try {
+      if (this._pairingRefreshCount > 0) {
+        console.log('⚠️  PREVIOUS CODE EXPIRED — requesting a fresh one...');
+      }
       console.log(`⚡ Requesting pairing code for ${phone}...`);
       const code = await this.sock.requestPairingCode(phone);
       this.pairingCode = code;
+      this._pairingRefreshCount++;
       printPairingCode(code);
       console.log('⏳ Waiting for you to link the device...');
       this._startRegistrationWatcher();
     } catch (e) {
       console.error('❌ Pairing request failed:', e?.message || e);
-      // The close handler reconnects; the cooldown prevents an instant retry loop.
     }
   }
 
@@ -185,7 +204,6 @@ class BotController {
       }
     }, 5000);
 
-    // Auto-refresh: if still unlinked, issue a fresh code (old one likely expired)
     this._pairingRefreshTimer = setTimeout(() => this._refreshPairingCode(), PAIRING_REFRESH_MS);
   }
 
@@ -196,26 +214,12 @@ class BotController {
 
   async _refreshPairingCode() {
     if (this._closed || this.state?.creds?.registered || !this.sock) return;
-    const phone = this._lastPairingPhone || config.phoneNumber;
-    if (!phone) return;
-    console.log('🔁 No link detected yet — previous code may have expired. Requesting a fresh one...');
-    try {
-      const code = await this.sock.requestPairingCode(phone);
-      this.lastPairingRequestAt = Date.now();
-      this.pairingCode = code;
-      printPairingCode(code);
-      this._startRegistrationWatcher();
-    } catch (e) {
-      console.error('❌ Pairing refresh failed:', e?.message || e);
-      this._pairingRefreshTimer = setTimeout(() => this._refreshPairingCode(), PAIRING_REFRESH_MS);
-    }
+    this._handlePairingTrigger();
   }
 
   _handleConnectionUpdate(update) {
     const { connection, lastDisconnect } = update;
 
-    // 🔑 KEY FIX: Baileys never emits 'open' for a new device — the pairing
-    // code must be requested during the 'connecting'/QR phase instead.
     if (connection === 'connecting' && !this.state?.creds?.registered) {
       this._handlePairingTrigger();
     }
@@ -228,7 +232,6 @@ class BotController {
       this.pairingCode = null;
 
       if (!this.state?.creds?.registered) {
-        // Fallback for Baileys builds that do fire 'open' before pairing
         if (this.pairingMode) this._handlePairingTrigger();
         return;
       }
@@ -246,7 +249,6 @@ class BotController {
       const reason = lastDisconnect?.error?.message || `status ${code}`;
       const wasRegistered = this.state?.creds?.registered === true;
 
-      // ─── REAL logout — only possible if we had a working session ───
       if (code === DisconnectReason.loggedOut && wasRegistered) {
         console.warn('❌ Logged out of WhatsApp.');
         this._stopRegistrationWatcher();
@@ -261,7 +263,6 @@ class BotController {
         return;
       }
 
-      // ─── 401 during pairing is NOT a logout — never wipe the session folder ───
       if (code === DisconnectReason.loggedOut) {
         console.log('🔌 Connection closed during pairing (not a logout). Reconnecting...');
         this._scheduleReconnect();
@@ -320,7 +321,7 @@ class BotController {
       console.log(`📣 Auto-joined channel: ${meta?.name || config.channelLink}`);
     } catch (e) {
       console.warn(`⚠️ Could not auto-join channel (${e?.message || e}). The bot continues normally.`);
-      this.channelJoined = false; // retry on next connection open
+      this.channelJoined = false;
     }
   }
 
@@ -371,7 +372,6 @@ class BotController {
     const { isPremium } = await import('../lib/database.js');
     const { getChatbotReply } = await import('../lib/ai.js');
 
-    // Chatbot auto-reply for premium users (non-command messages)
     if (!text.startsWith(prefix)) {
       const db = (await import('../lib/database.js')).getDB();
       if (db.chatbotUsers?.[senderNumber] === true) {
@@ -400,7 +400,6 @@ class BotController {
     const command = args.shift()?.toLowerCase();
     if (!command) return;
 
-    // Chatbot toggle commands handled before generic dispatch
     if (command === 'chatbot' || command === 'prem' || command === 'premium') {
       const handled = await this._handleSpecialCommands(command, args, msg, from, senderNumber, isOwner);
       if (handled) return;
